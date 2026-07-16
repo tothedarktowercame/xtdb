@@ -90,13 +90,16 @@ This branch tokenises every utf8 column wherever blooms are calculated.
 A mergeable feature wants an opt-in per-table/column policy (config YAML surface), since the cost is re-analysis of every row at every compaction level.
 `PageTrieWriter.writeSubtree` already distinguishes copy-page-wholesale from split-leaf, so intact pages could carry their sketches forward — unexploited here.
 
-Bloom sizing::
-The term bloom reuses the value bloom's 22-bit/k=5 sizing.
-A page has many more distinct tokens than distinct values, so the false-positive rate will be worse; sizing (or a distinct default) should be settled by measurement, not inherited.
+Bloom sizing — *measured, resolved*::
+The term bloom reuses the value bloom's 22-bit/k=5 sizing; `xtdb.expression.text-bloom-sizing-test` measures it through the real write and query paths (20k absent-token probes per point).
+False positives are a non-issue at realistic page sizes: zero observed through 50k distinct tokens/page, 5×10^-5^ at 100k, 3×10^-4^ at 200k.
+The real cost axis is _serialized size_: the roaring bitmap densifies with token count and saturates at ~512KB/page (≈100KB at 10k tokens, ≈10KB at 1k).
+That per-page metadata cost — not FP rate — is the number the indexing-policy decision above should weigh, and it is the strongest argument for per-column opt-in.
 
-Oracle property test::
-The right verification shape is an oracle: generated corpora and queries, asserting bloom+recheck ≡ naive full-scan match across compaction levels, updates, deletes, erases, union-typed columns, and non-BMP text.
-The existing property-test infrastructure fits this directly.
+Oracle property test — *in this branch*::
+`xtdb.expression.text-property-test` generates random op sequences (puts/updates/deletes/erases over a small id pool; bodies exercising casing, punctuation, accents, CJK, Cyrillic, and non-BMP letters) and asserts that `text_match` through the real index path agrees with a naive oracle in four modes: live and compacted, as-of-now and `FOR ALL SYSTEM_TIME`.
+A pruning false negative — the silent failure class from I-1/I-4 — surfaces as a missing id after compaction.
+Green at 100 iterations.
 
 Benchmarks::
 The claim that needs numbers is _pruning pays for its write cost_:
@@ -143,3 +146,5 @@ We run the sidecar-shaped equivalent in production (candidate + recheck, delete-
 * v2.1.0: `xtdb.expression.text-test` 5/5; regressions `metadata-test` 11/11, `expression-test` 107/107, `sql-test` 155/155.
 * `main` (`c98b6d4ef`): patch applies clean, `:xtdb-core:compileKotlin` clean, `text-test` 5/5; regressions `expression-test` 110/110, `sql-test` 163/163, `metadata-test` 11/11.
   Only drift since v2.1.0: the test-fixture rename `finish-block!` → `flush-block!`.
+* Oracle property test: 100 iterations, 0 failures (`:property-test`, ~1.1s/trial).
+* Bloom sizing sweep: see the resolved limitation entry above for the numbers.
