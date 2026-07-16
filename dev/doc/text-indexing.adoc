@@ -1,0 +1,145 @@
+= Text indexing (#5637): candidate-generation design
+:toc:
+
+Design proposal for the text-indexing epic (#5637), together with a working end-to-end slice (`text_match` + a tokenised per-page term bloom) that exercises every seam this document names.
+Written from a close read of the 2.x internals (originally against v2.1.0, verified against current `main`), plus operational experience running an external candidate+recheck text index beside XTDB in production.
+
+== Scope decision
+
+Of the feature ladder in the issue (exact-match → prefix → boolean → phrase → fuzzy → ranking → linguistic), this design covers:
+
+* *exact-match on analysed tokens* — natively;
+* *boolean AND* — natively (a multi-term needle requires every term);
+* *boolean OR/NOT* — by SQL/XTQL composition (`text_match(body,'fox') OR text_match(body,'dog')`), which the metadata layer already prunes correctly through `and`/`or`.
+
+It deliberately defers prefix, phrase, fuzzy, ranking, and linguistic analysis — see <<postings,§Postings>> for why those are a different data model and how they'd slot in later without disturbing this layer.
+
+== The load-bearing observation
+
+XTDB's scan is already a candidate+recheck engine:
+per-page min/max, value blooms, and presence sketches prune pages, and `col-preds` re-evaluate the authoritative predicate on every surviving row _after_ the bitemporal merge.
+Correctness never depends on pruning — the live-index segment is scanned with no metadata predicate at all and flows through the same `ScanCursor`.
+
+A text index that generates candidates and lets the scan recheck therefore needs *no new operator, no `scan.clj`/`ScanCursor` changes, and no storage version bump*.
+The slice in this branch is exactly that shape.
+
+== Contract and invariants
+
+I-1: *the index is a candidate generator; the scan's recheck is the authoritative matcher.*
+Index output may over-approximate (false positives) and must never under-approximate at page level: a page containing a term always has that term's hashes in its bloom.
+
+I-2: *any candidate handed across the scan boundary must be IID-granular, never row-granular.*
+The `pushdown-iids` seam applies its selector _before_ `PolygonCalculator`; that is sound only because IID filtering is entity-granular — every surviving IID still presents its complete system-time-descending event history, so the Ceiling reconstructs identically.
+A row-granular candidate set drops shadowing/delete/erase events and can emit superseded or erased data.
+
+I-3: *deletes, erases, and valid-time corrections need zero index maintenance* — a direct consequence of I-1.
+The core is append-only and resolves visibility at read time; stale postings are just false positives, killed by the recheck.
+This stops being true the moment index hits are returned directly (ranking, `LIMIT`, counts) — which is one reason ranking is out of scope here.
+
+I-4: *one analysis chain, shared verbatim* by the write-side sketch, the query-side pruning hashes, and the recheck.
+If they diverge, pruning drops pages the recheck would have matched — a silent under-reporting failure.
+In this branch that is `xtdb.text.TextSearch`, used by all three.
+
+== Tiers: what you index, not how you query it
+
+The scoping axis for the epic's "audit vs current-state" requirement is whether the index covers the latest version only, or every version:
+
+|===
+| tier | indexes | contract | buys | costs
+
+| latest-only | latest version only | candidate + recheck | now-only text search | ~zero
+| *all-versions* | *all versions* | candidate + recheck | time-travel text search; `FOR SYSTEM_TIME`/`FOR VALID_TIME` correctness | index ∝ #versions; larger candidate sets
+|===
+
+*Recommendation: all-versions.*
+Because tries retain every row version and the bitemporal merge resolves visibility at read time, this needs no bitemporal logic in the index at all — the per-page term bloom in this branch indexes all versions _by construction_, and the branch's tests show a superseded document version findable under `FOR ALL SYSTEM_TIME WHERE text_match(...)` while correctly absent as-of-now.
+
+A latest-only index is worth naming only as a trap:
+its recheck kills false positives but cannot recover false negatives, so it silently under-reports any historical query — if a design ends up there, that must be a stated contract, not a discovered bug.
+
+(A third conceivable tier — an authoritative as-of index that skips the recheck — is not a reasonable candidate for XTDB itself and we don't propose it:
+`_system_to` is never stored, so a posting's temporal extent depends on future shadowing events, and materialising it means continuously rewriting postings against the immutable-file model, all to eliminate a recheck the engine performs anyway.)
+
+== Data model (this branch)
+
+Per-page term bloom, in the existing metadata file:
+
+* `ColumnMetadata.writeBytesMetadata` writes a `text-bloom` sub-vector beside the existing `bloom`, for utf8 flavours only.
+* Same bloom construction as the value bloom (`BLOOM_BITS`/`BLOOM_K`, Xx + Murmur3 double hashing), but over the UTF-8 bytes of each _token_ of each value, rather than each whole value.
+* The per-page `columns` element is an open struct — readers use `vectorForOrNull`, so pre-existing meta files (and files written with blooms off) degrade to fetch-and-recheck.
+  No `Storage.VERSION` bump.
+* Gated on the existing `calculateBlooms` policy: compaction computes it, L0 skips it.
+
+Query side:
+
+* `codegen-call [:text_match :utf8 :utf8]` — the recheck; AND-of-terms, case-folded, no stemming; a needle with no tokens matches vacuously (the pruning side implements the same convention: zero term-hashes ⇒ page kept).
+* SQL: `text_match(col, 'terms')` via `def-sql-fns` — no grammar change.
+  XTQL: `(text-match col "terms")` — zero planner change.
+* `text_match` references exactly one scan column, so `add-selection-to-scan-predicate` folds it into `:scan`, landing it in `col-preds` (recheck) and `metadata-args` (pruning) automatically.
+* `:test-text-bloom` metadata predicate: every needle-term's hashes must hit the page's term bloom, else the page is never fetched.
+
+Write-path placement is deliberate:
+tokenisation runs on the compaction path, not in `logPut` — ingestion is single-threaded and fail-stop, and arbitrary text analysis does not belong in that blast radius.
+
+== Limitations and open items
+
+Stated as scope boundaries, roughly in the order we'd tackle them:
+
+Indexing policy and configuration::
+This branch tokenises every utf8 column wherever blooms are calculated.
+A mergeable feature wants an opt-in per-table/column policy (config YAML surface), since the cost is re-analysis of every row at every compaction level.
+`PageTrieWriter.writeSubtree` already distinguishes copy-page-wholesale from split-leaf, so intact pages could carry their sketches forward — unexploited here.
+
+Bloom sizing::
+The term bloom reuses the value bloom's 22-bit/k=5 sizing.
+A page has many more distinct tokens than distinct values, so the false-positive rate will be worse; sizing (or a distinct default) should be settled by measurement, not inherited.
+
+Oracle property test::
+The right verification shape is an oracle: generated corpora and queries, asserting bloom+recheck ≡ naive full-scan match across compaction levels, updates, deletes, erases, union-typed columns, and non-BMP text.
+The existing property-test infrastructure fits this directly.
+
+Benchmarks::
+The claim that needs numbers is _pruning pays for its write cost_:
+query latency vs term selectivity with/without the sketch, compaction throughput overhead from tokenisation, and per-page index size, on a realistic corpus.
+
+Live/L0 tier::
+Live and L0 pages carry no sketch; the recheck covers them, and their volume is bounded by the block cadence (102,400 rows / 4h).
+Documented contract for now; an in-memory live-tier sketch is the fix if measurement says it matters.
+Note L0 sets `calculateBlooms = false`, so even flushed-but-uncompacted blocks rely on recheck.
+
+Analysis chain::
+`TextSearch` is a deliberately minimal Unicode lowercase tokeniser (no stemming, no stop-words, no diacritic folding).
+The intended evolution is to adopt `org.apache.lucene.analysis` — analyzers are genuinely separable from Lucene's storage and query engine — behind the same three-way-shared interface, pluggable per column.
+That is also our answer to the epic's Lucene question: *adopt the analysis chain only; persist Arrow-native.*
+The read-path value (mmap slice cache, disk cache, per-page lazy fetch, multipart cut alignment) is conditional on the index being an Arrow file with a footer, and a Lucene `Directory` brings a second lifecycle manager over data the compactor already rewrites.
+
+Single-column predicates::
+Pushdown requires the predicate to reference exactly one scan column, so the surface is `text_match(body, 'x')`, not `text_match(title||body, 'x')`.
+Multi-column search composes at the query level.
+
+[[postings]]
+Postings tier (prefix/phrase/ranking)::
+Those features need term→IID postings (and positions), which we'd persist as a third per-trie file type — `tables/<t>/text/<trieKey>.arrow` — sibling to `data/` and `meta/`:
+independently deletable and rebuildable (absent file ⇒ fall back to scan), and rebuilt rather than merged at compaction, so no Lucene merge machinery ever.
+Candidates from postings feed the existing `pushdown-iids` seam (I-2).
+Ranking additionally collides with I-3 — scores over history are not well-defined and index hits would be returned directly — so `ORDER BY` relevance should initially be scoped as-of-now-only.
+Out of scope here; sketched so the bloom layer visibly doesn't paint over it.
+
+One question for maintainers::
+Per-page content pruning composes with the temporal machinery today (value blooms prune pages under the same regime), and the term bloom inherits that soundness argument verbatim — same seam, same over-approximation property.
+We would, however, like a maintainer's confirmation of one interaction we could not fully resolve from source:
+under _range_ bases (`FOR SYSTEM_TIME FROM ... TO ...`), whether content-pruning a page containing only shadowing events can affect the derived system-time-end of rows emitted from surviving pages.
+Whatever the answer, it applies equally to the existing value bloom; the term bloom adds no new exposure.
+
+== Alternative: an external-index provider seam
+
+A smaller-surface alternative to any native index:
+formalise `pushdown-iids` as a public extension point, so an external index (Lucene, Tantivy, SQLite FTS5, ...) can supply candidate IIDs and narrow a native scan — structurally identical to a hash-join key pushdown, with I-2 enforced by the seam's type.
+This keeps analysis-chain choices out of core entirely.
+We run the sidecar-shaped equivalent in production (candidate + recheck, delete-and-rebuild derived index) and can report it is operationally sound; the native bloom layer in this branch and an external provider seam are complementary, not competing.
+
+== Verification status
+
+* v2.1.0: `xtdb.expression.text-test` 5/5; regressions `metadata-test` 11/11, `expression-test` 107/107, `sql-test` 155/155.
+* `main` (`c98b6d4ef`): patch applies clean, `:xtdb-core:compileKotlin` clean, `text-test` 5/5; regressions `expression-test` 110/110, `sql-test` 163/163, `metadata-test` 11/11.
+  Only drift since v2.1.0: the test-fixture rename `finish-block!` → `flush-block!`.
