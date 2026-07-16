@@ -1,6 +1,7 @@
 (ns xtdb.expression.metadata
   (:require [xtdb.expression :as expr]
             [xtdb.expression.constraints :as constraints]
+            xtdb.expression.text
             [xtdb.expression.walk :as ewalk]
             [xtdb.serde.types :as st]
             [xtdb.types :as types]
@@ -11,7 +12,8 @@
            (xtdb.arrow RelationReader Vector VectorReader VectorType VectorType$Mono)
            (xtdb.arrow.metadata MetadataFlavour MetadataFlavour$Bytes MetadataFlavour$Presence)
            (xtdb.bloom BloomUtils)
-           (xtdb.metadata MetadataPredicate PageMetadata)))
+           (xtdb.metadata MetadataPredicate PageMetadata)
+           (xtdb.text TextSearch)))
 
 (set! *unchecked-math* :warn-on-boxed)
 
@@ -93,6 +95,23 @@
                          {:op :test-not-null
                           :col (:variable nil-arg)}))))
 
+            ;; tokenised per-page term bloom (#5637): prune pages that can't
+            ;; contain every needle term. Only prunable with the column as
+            ;; haystack and a fixed needle; anything else falls through to
+            ;; "pull the block and look".
+            ;; (SQL plans the underscore form; RA/XTQL forms arrive kebab —
+            ;; only codegen-call dispatch normalises, so accept both here)
+            (:text_match :text-match)
+            (when-let [[field-val-tag col-expr val-expr] (normalise-bool-args args)]
+              (case field-val-tag
+                :constant expr
+                :col-val {:op :test-text-bloom
+                          :col (:variable col-expr)
+                          :value-expr val-expr
+                          :text? true
+                          :bloom-hash-sym (gensym 'text-bloom-hashes)}
+                :val-col nil))
+
             (:< :<= :> :>= :==)
             (when-let [[field-val-tag col-expr val-expr] (normalise-bool-args args)]
               (case field-val-tag
@@ -139,13 +158,21 @@
 
 (defn- ->bloom-hashes [^BufferAllocator allocator, expr ^RelationReader params]
   (vec
-   (for [{:keys [value-expr]} (->> (ewalk/expr-seq expr) (filter :bloom-hash-sym))]
-     (case (:op value-expr)
-       :literal (let [lit (:literal value-expr)]
-                  (with-open [tmp-vec (Vector/fromList allocator "lit", ^List (vector lit))]
-                    (BloomUtils/bloomHashes tmp-vec 0)))
+   (for [{:keys [value-expr text?]} (->> (ewalk/expr-seq expr) (filter :bloom-hash-sym))]
+     (if text?
+       ;; a vector of per-token hash arrays: the page must contain every one
+       (let [needle (case (:op value-expr)
+                      :literal (:literal value-expr)
+                      :param (.getObject (.vectorFor params (str (:param value-expr))) 0))]
+         (->> (TextSearch/tokenize (str needle))
+              (mapv #(TextSearch/tokenHashes %))))
 
-       :param (BloomUtils/bloomHashes (.vectorFor params (str (:param value-expr))) 0)))))
+       (case (:op value-expr)
+         :literal (let [lit (:literal value-expr)]
+                    (with-open [tmp-vec (Vector/fromList allocator "lit", ^List (vector lit))]
+                      (BloomUtils/bloomHashes tmp-vec 0)))
+
+         :param (BloomUtils/bloomHashes (.vectorFor params (str (:param value-expr))) 0))))))
 
 (def ^:private table-metadata-sym (gensym "table-metadata"))
 (def ^:private metadata-rdr-sym (gensym "metadata-rdr"))
@@ -168,6 +195,26 @@
                              (or (nil? ~bloom-vec-sym)
                                  (.isNull ~bloom-vec-sym ~expr/idx-sym)
                                  (BloomUtils/bloomContains ~bloom-vec-sym ~expr/idx-sym ~bloom-hash-sym)))))))}))
+
+(defmethod expr/codegen-expr :test-text-bloom [{:keys [col bloom-hash-sym]} _opts]
+  (let [bloom-vec-sym (gensym "text-bloom-vec")]
+    {:return-type #xt/type :bool
+     :batch-bindings [[bloom-vec-sym `(some-> (.vectorForOrNull ~col-rdr-sym "bytes")
+                                              (.vectorForOrNull "text-bloom"))]]
+     :continue (fn [cont]
+                 (cont #xt/type :bool
+                       `(boolean
+                         (let [~expr/idx-sym (.rowIndex ~table-metadata-sym ~(str col) ~page-idx-sym)]
+                           (if (neg? ~expr/idx-sym)
+                             false
+
+                             ;; if this col is present but we haven't built text blooms
+                             ;; (pre-existing files, or `calculateBlooms` off), we have to scan
+                             (or (nil? ~bloom-vec-sym)
+                                 (.isNull ~bloom-vec-sym ~expr/idx-sym)
+                                 (every? (fn [token-hashes#]
+                                           (BloomUtils/bloomContains ~bloom-vec-sym ~expr/idx-sym token-hashes#))
+                                         ~bloom-hash-sym)))))))}))
 
 (defmethod expr/codegen-expr :test-presence [{:keys [col ^VectorType value-type]} _opts]
   (let [presence-vec (gensym 'presence)]

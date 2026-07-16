@@ -1,6 +1,7 @@
 package xtdb.metadata
 
 import com.carrotsearch.hppc.IntArrayList
+import org.apache.arrow.vector.types.pojo.ArrowType
 import xtdb.arrow.BOOL_TYPE
 import xtdb.arrow.F64_TYPE
 import xtdb.arrow.I32_TYPE
@@ -20,7 +21,10 @@ import xtdb.arrow.metadata.MetadataFlavour.Companion.metaColName
 import xtdb.arrow.toLeg
 import xtdb.bloom.BloomBuilder
 import xtdb.bloom.toByteBuffer
+import xtdb.text.tokenize
 import xtdb.trie.RowIndex
+import java.nio.ByteBuffer
+import java.nio.charset.StandardCharsets.UTF_8
 import kotlin.reflect.KClass
 
 class ColumnMetadata(private val colsVec: VectorWriter, private val calculateBlooms: Boolean) {
@@ -57,11 +61,27 @@ class ColumnMetadata(private val colsVec: VectorWriter, private val calculateBlo
         if (flavours.isNotEmpty()) {
             val typeVec = colsVec.vectorFor(Bytes::class.java.metaColName, STRUCT_TYPE, false)
             val bloomVec = typeVec.vectorFor("bloom", VAR_BINARY_TYPE, true)
+            val textBloomVec = typeVec.vectorFor("text-bloom", VAR_BINARY_TYPE, true)
 
             if (calculateBlooms) {
                 val bloomBuilder = BloomBuilder()
                 flavours.forEach { bloomBuilder.add(it) }
                 bloomVec.writeBytes(bloomBuilder.build().toByteBuffer())
+
+                val utf8s = flavours.filter { it.arrowType is ArrowType.Utf8 }
+                if (utf8s.isNotEmpty()) {
+                    val textBloomBuilder = BloomBuilder()
+                    for (flavour in utf8s) {
+                        repeat(flavour.valueCount) { idx ->
+                            if (!flavour.isNull(idx)) {
+                                for (token in tokenize(UTF_8.decode(flavour.getBytes(idx)).toString())) {
+                                    textBloomBuilder.add(ByteBuffer.wrap(token.toByteArray(UTF_8)))
+                                }
+                            }
+                        }
+                    }
+                    textBloomVec.writeBytes(textBloomBuilder.build().toByteBuffer())
+                }
             }
 
             typeVec.endStruct()

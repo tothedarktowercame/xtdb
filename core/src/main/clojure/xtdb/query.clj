@@ -7,6 +7,7 @@
             [xtdb.expression :as expr]
             xtdb.expression.pg
             xtdb.expression.temporal
+            xtdb.expression.text
             xtdb.expression.uri
             [xtdb.logical-plan :as lp]
             [xtdb.metrics :as metrics]
