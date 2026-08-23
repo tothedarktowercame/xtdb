@@ -2,6 +2,7 @@
   (:require [clojure.string :as str]
             [xtdb.error :as err]
             [xtdb.expression.macro :as macro]
+            [xtdb.expression.walk :as ewalk]
             [xtdb.serde :as serde]
             [xtdb.serde.types :as st]
             [xtdb.time :as time]
@@ -482,6 +483,44 @@
      :continue (fn [f]
                  (f return-type (emit-value literal-type literal)))
      :literal literal}))
+
+(def literal-slots-sym (gensym 'literal-slots))
+
+(def ^:private literal-slot-call-fns #{:== :<> :< :<= :> :>=})
+(def ^:private literal-slot-classes #{String Keyword Long Double Boolean UUID})
+
+(defn hoist-runtime-literals [expr]
+  (let [!literals (atom [])]
+    {:expr
+     (letfn [(hoist [expr]
+               (ewalk/walk-expr
+                hoist
+                (fn [{:keys [op f] :as expr}]
+                  (if (and (= :call op) (contains? literal-slot-call-fns f))
+                    (update expr :args
+                            (fn [args]
+                              (mapv (fn [{:keys [op literal] :as arg}]
+                                      (if (and (= :literal op)
+                                               (contains? literal-slot-classes (class literal)))
+                                        (let [slot (count @!literals)]
+                                          (swap! !literals conj literal)
+                                          {:op :literal-slot
+                                           :slot slot
+                                           :literal-class (class literal)
+                                           :literal-type (types/value->vec-type literal)})
+                                        arg))
+                                    args)))
+                    expr))
+                expr))]
+       (hoist expr))
+     :literals @!literals}))
+
+(defmethod codegen-expr :literal-slot [{:keys [slot literal-class literal-type]} _]
+  {:return-type literal-type
+   :continue (fn [f]
+               (f literal-type
+                  (emit-value literal-class
+                              (with-tag `(nth ~literal-slots-sym ~slot) literal-class))))})
 
 (defn prepare-expr [expr]
   (->> expr
@@ -2414,21 +2453,18 @@
       :else
       (err/incorrect ::unknown-arithmetic-error "data exception - arithmetic exception" {::err/cause cause}))))
 
-(def ^:private emit-projection
-  "NOTE: we macroexpand inside the memoize on the assumption that
-   everything outside yields the same result on the pre-expanded expr - this
-   assumption wouldn't hold if macroexpansion created new variable exprs, for example.
-   macroexpansion is non-deterministic (gensym), so busts the memo cache."
+(def ^:private compile-projection
+  "Compiles an already-prepared expression whose runtime literals have been replaced by typed slots."
   (-> (fn [expr opts]
-        (let [expr (prepare-expr expr)
-              {:keys [return-type continue] :as emitted-expr} (codegen-expr expr opts)
+        (let [{:keys [return-type continue] :as emitted-expr} (codegen-expr expr opts)
               {:keys [writer-bindings write-value-out!]} (write-value-out-code return-type)]
           (assert return-type (pr-str expr))
           {:!projection-fn (delay
                              (-> `(fn [~(-> rel-sym (with-tag RelationReader))
                                        ~(-> schema-sym (with-tag IPersistentMap))
                                        ~(-> args-sym (with-tag RelationReader))
-                                       ~(-> out-vec-sym (with-tag Vector))]
+                                       ~(-> out-vec-sym (with-tag Vector))
+                                       ~(-> literal-slots-sym (with-tag List))]
                                     (let [~@(batch-bindings emitted-expr)
                                           ~@writer-bindings
                                           row-count# (.getRowCount ~rel-sym)]
@@ -2442,6 +2478,10 @@
            :return-type return-type}))
       (util/lru-memoize) ; <<no-commit>>
       wrap-zone-id-cache-buster))
+
+(defn- emit-projection [expr opts]
+  (let [{:keys [expr literals]} (-> expr prepare-expr hoist-runtime-literals)]
+    (assoc (compile-projection expr opts) :literal-slots literals)))
 
 (defn ->param-types [^RelationReader args]
   (->> args
@@ -2466,11 +2506,11 @@
                                              [(symbol (.getName iv))
                                               (.getType iv)]))))
 
-              {:keys [return-type !projection-fn]} (emit-projection expr {:param-types (->param-types args)
-                                                                          :var-types var-types})]
+              {:keys [return-type !projection-fn literal-slots]} (emit-projection expr {:param-types (->param-types args)
+                                                                                        :var-types var-types})]
           (util/with-close-on-catch [out-vec (Vector/open allocator (str col-name) return-type)]
             (try
-              (@!projection-fn in-rel schema args out-vec)
+              (@!projection-fn in-rel schema args out-vec literal-slots)
               (catch ArithmeticException e
                 (throw (arithmetic-ex->anomaly e)))
               (catch NumberFormatException e

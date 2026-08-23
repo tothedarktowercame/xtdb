@@ -6,9 +6,11 @@
             [clojure.test.check.properties :as tcp]
             [clojure.tools.logging :as log]
             [xtdb.expression :as expr]
+            [xtdb.expression.metadata :as expr.meta]
             [xtdb.test-util :as tu]
             [xtdb.time :as time]
             [xtdb.types :as types]
+            [xtdb.util :as util]
             [xtdb.vector.reader :as vr]
             [xtdb.vector.writer :as vw])
   (:import (java.nio ByteBuffer)
@@ -92,6 +94,42 @@
       (t/testing "parameter"
         (t/is (= 500 (select-relation '(>= a ?a) '{a #xt/type :f64} {:a 500})))
         (t/is (= 500 (select-relation '(>= e ?e) '{e #xt/type :utf8} {:e "0500"})))))))
+
+(t/deftest scalar-comparison-literals-share-compiled-code
+  (let [input-types {:var-types '{e #xt/type :utf8}, :param-types {}}
+        eval-fn clojure.core/eval
+        !eval-count (atom 0)]
+    (util/clear-known-lru-memo-tables!)
+    (with-redefs [clojure.core/eval (fn [form]
+                                     (swap! !eval-count inc)
+                                     (eval-fn form))]
+      (doseq [literal ["a" "b"]]
+        (let [{:keys [expr]} (-> (expr/form->expr (list '== 'e literal) input-types)
+                                 expr/prepare-expr
+                                 expr/hoist-runtime-literals)]
+          @(-> (#'expr/compile-projection expr input-types) :!projection-fn))))
+    (t/is (= 1 @!eval-count))))
+
+(t/deftest scalar-comparison-literals-share-metadata-code
+  (let [opts {:var-types '{e #xt/type :utf8}, :param-types {}}
+        ->expr #(expr/form->expr (list '== 'e %) opts)
+        eval-fn clojure.core/eval
+        !eval-count (atom 0)]
+    (util/clear-known-lru-memo-tables!)
+    (with-redefs [clojure.core/eval (fn [form]
+                                     (swap! !eval-count inc)
+                                     (eval-fn form))]
+      (#'expr.meta/compile-meta-expr (->expr "a") opts)
+      (#'expr.meta/compile-meta-expr (->expr "b") opts))
+    (t/is (= 1 @!eval-count))))
+
+(t/deftest literal-hoisting-is-limited-to-scalar-comparisons
+  (let [input-types {:var-types '{e #xt/type :utf8, d #xt/type [:decimal 32 2 128]},
+                     :param-types {}}
+        hoist #(-> % (expr/form->expr input-types) expr/prepare-expr expr/hoist-runtime-literals)]
+    (t/is (= [] (:literals (hoist '(like e "a%")))))
+    (t/is (= [] (:literals (hoist '(round d 2)))))
+    (t/is (= ["a"] (:literals (hoist '(== e "a")))))))
 
 (t/deftest nil-selection-doesnt-yield-the-row
   (t/is (= 0

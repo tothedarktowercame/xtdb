@@ -33,7 +33,13 @@
           nil))
       expr))
 
-(def ^:private normalise-bool-args constraints/normalise-bool-args)
+(defn- normalise-bool-args [[x-expr y-expr :as args]]
+  (let [as-literal #(cond-> % (= :literal-slot (:op %)) (assoc :op :literal))]
+    (when-let [[tag] (constraints/normalise-bool-args (mapv as-literal args))]
+      (case tag
+        :col-val [tag x-expr y-expr]
+        :val-col [tag y-expr x-expr]
+        [tag]))))
 
 (defn- minmax-expr [f min-or-max {col :variable} value-expr]
   (let [val-sym (gensym 'val)
@@ -51,6 +57,7 @@
   (-> {:op :call, :f :or
        :args (let [^VectorType value-type (case (:op value-expr)
                                             :literal (types/value->vec-type (:literal value-expr))
+                                            :literal-slot (:literal-type value-expr)
                                             :param (:param-type value-expr))]
                (for [^VectorType leg-type (.getLegs value-type)]
                  (if (= MetadataFlavour$Bytes (MetadataFlavour/getMetadataFlavour leg-type))
@@ -66,6 +73,7 @@
   (-> {:op :call, :f :or
        :args (let [^VectorType value-type (case (:op value-expr)
                                             :literal (types/value->vec-type (:literal value-expr))
+                                            :literal-slot (:literal-type value-expr)
                                             :param (:param-type value-expr))]
                (for [^VectorType leg-type (.getLegs value-type)]
                  (if (= MetadataFlavour$Presence (MetadataFlavour/getMetadataFlavour leg-type))
@@ -128,7 +136,7 @@
 
 (defn meta-expr [{:keys [op] :as expr} opts]
   (case op
-    (:literal :param :let) nil ;; expected to be filtered out by the caller, using simplify-and-or-expr
+    (:literal :literal-slot :param :let) nil ;; expected to be filtered out by the caller, using simplify-and-or-expr
     :variable {:op :literal, :literal true}
     :if (-> {:op :call
              :f :or
@@ -137,13 +145,17 @@
             simplify-and-or-expr)
     :call (call-meta-expr expr opts)))
 
-(defn- ->bloom-hashes [^BufferAllocator allocator, expr ^RelationReader params]
+(defn- ->bloom-hashes [^BufferAllocator allocator, expr ^RelationReader params literal-slots]
   (vec
    (for [{:keys [value-expr]} (->> (ewalk/expr-seq expr) (filter :bloom-hash-sym))]
      (case (:op value-expr)
        :literal (let [lit (:literal value-expr)]
                   (with-open [tmp-vec (Vector/fromList allocator "lit", ^List (vector lit))]
                     (BloomUtils/bloomHashes tmp-vec 0)))
+
+       :literal-slot (let [lit (nth literal-slots (:slot value-expr))]
+                       (with-open [tmp-vec (Vector/fromList allocator "lit", ^List (vector lit))]
+                         (BloomUtils/bloomHashes tmp-vec 0)))
 
        :param (BloomUtils/bloomHashes (.vectorFor params (str (:param value-expr))) 0)))))
 
@@ -244,15 +256,16 @@
 
 (defmethod ewalk/direct-child-exprs :test-minmax [{:keys [value-expr]}] #{value-expr})
 
-(def ^:private compile-meta-expr
+(def ^:private compile-hoisted-meta-expr
   (-> (fn [expr opts]
-        (let [expr (or (-> expr (expr/prepare-expr) (meta-expr opts) (expr/prepare-expr))
+        (let [expr (or (-> expr (meta-expr opts) (expr/prepare-expr))
                        (expr/prepare-expr {:op :literal, :literal true}))
               {:keys [continue] :as emitted-expr} (expr/codegen-expr expr opts)]
           {:expr expr
            :f (-> `(fn [~(-> table-metadata-sym (expr/with-tag PageMetadata))
                         ~(-> expr/args-sym (expr/with-tag RelationReader))
-                        [~@(keep :bloom-hash-sym (ewalk/expr-seq expr))]]
+                        [~@(keep :bloom-hash-sym (ewalk/expr-seq expr))]
+                        ~(-> expr/literal-slots-sym (expr/with-tag List))]
                      (let [~metadata-rdr-sym (.getMetadataLeafReader ~table-metadata-sym)
                            ~col-rdr-sym (-> (.vectorFor ~metadata-rdr-sym "columns")
                                             (.getListElements))
@@ -266,13 +279,19 @@
 
       (util/lru-memoize)))
 
+(defn- compile-meta-expr [expr opts]
+  (let [{hoisted-expr :expr, :keys [literals]} (-> expr expr/prepare-expr expr/hoist-runtime-literals)
+        compiled (compile-hoisted-meta-expr hoisted-expr opts)]
+    (assoc compiled
+           :literal-slots literals)))
+
 (defn ->metadata-selector ^xtdb.metadata.MetadataPredicate [allocator form var-types args]
   (let [param-types (expr/->param-types args)
-        {:keys [expr f]} (compile-meta-expr (expr/form->expr form {:param-types param-types,
-                                                                   :var-types var-types})
-                                            {:param-types param-types
-                                             :var-types var-types})
-        bloom-hashes (->bloom-hashes allocator expr args)]
+        {:keys [expr f literal-slots]} (compile-meta-expr (expr/form->expr form {:param-types param-types,
+                                                                                 :var-types var-types})
+                                                          {:param-types param-types
+                                                           :var-types var-types})
+        bloom-hashes (->bloom-hashes allocator expr args literal-slots)]
     (reify MetadataPredicate
       (build [_ table-metadata]
-        (f table-metadata args bloom-hashes)))))
+        (f table-metadata args bloom-hashes literal-slots)))))
