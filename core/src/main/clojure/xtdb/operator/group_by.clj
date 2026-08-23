@@ -492,6 +492,7 @@
 
        (.forEachRemaining in-cursor
                           (fn [^RelationReader in-rel]
+                            (util/check-interrupted!)
                             (let [group-mapping (.groupMapping group-mapper in-rel)]
                               (doseq [^AggregateSpec agg-spec aggregate-specs]
                                 (.aggregate agg-spec in-rel group-mapping)))))

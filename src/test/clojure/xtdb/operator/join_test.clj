@@ -50,6 +50,44 @@
                         {:with-types? true, :preserve-pages? true}))
         "tables with no cols"))
 
+(t/deftest cancelled-cross-join-group-by-stops-promptly
+  (let [left-rows (mapv (fn [x] {:x x}) (range 2500))
+        right-rows (mapv (fn [y] {:y y}) (range 2500))
+        checking (promise)
+        outcome (promise)
+        allocator tu/*allocator*
+        check-interrupted! util/check-interrupted!
+        worker (Thread.
+                ^Runnable
+                (fn []
+                  (binding [tu/*allocator* allocator]
+                    (try
+                      (with-redefs [util/check-interrupted!
+                                    (fn []
+                                      (deliver checking true)
+                                      (check-interrupted!))]
+                        (deliver outcome
+                                 {:result
+                                  (tu/query-ra
+                                   [:group-by '{:columns [{n (row-count)}]}
+                                    [:cross-join {}
+                                     [::tu/pages [left-rows]]
+                                     [::tu/pages [right-rows]]]])}))
+                      (catch Throwable t
+                        (deliver outcome {:error t}))))))]
+    (.start worker)
+    (t/is (true? (deref checking 2000 false)) "query reaches an interrupt check")
+    (t/is (.isAlive worker) "query is running before interruption")
+    (let [interrupted-at (System/nanoTime)]
+      (.interrupt worker)
+      (.join worker 2000)
+      (t/is (not (.isAlive worker)) "interrupted query terminates within two seconds")
+      (t/is (< (/ (- (System/nanoTime) interrupted-at) 1e6) 2000)
+            "interrupt latency is under two seconds"))
+    (let [error (:error (deref outcome 0 nil))]
+      (t/is (instance? InterruptedException error)
+            (when error (with-out-str (.printStackTrace ^Throwable error)))))))
+
 (t/deftest test-equi-join
   (t/is (= {:res [#{{:a 12, :b 12}}
                   #{{:a 100, :b 100}

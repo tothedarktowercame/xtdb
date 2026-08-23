@@ -99,12 +99,16 @@
     (RelationReader/concatCols (.select left-rel
                                         (let [idxs (int-array row-count)]
                                           (dotimes [idx row-count]
+                                            (when (zero? (bit-and idx 0xFFF))
+                                              (util/check-interrupted!))
                                             (aset idxs idx ^long (quot idx right-row-count)))
                                           idxs))
 
                                (.select right-rel
                                         (let [idxs (int-array row-count)]
                                           (dotimes [idx row-count]
+                                            (when (zero? (bit-and idx 0xFFF))
+                                              (util/check-interrupted!))
                                             (aset idxs idx ^long (rem idx right-row-count)))
                                           idxs)))))
 

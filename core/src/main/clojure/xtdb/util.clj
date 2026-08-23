@@ -29,6 +29,10 @@
 
 (set! *unchecked-math* :warn-on-boxed)
 
+(defn check-interrupted! []
+  (when (Thread/interrupted)
+    (throw (InterruptedException.))))
+
 (defn maybe-update [m k f & args]
   (if (contains? m k)
     (apply update m k f args)
